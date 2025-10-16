@@ -1,0 +1,326 @@
+name: Infrastructure - Terraform
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/**'
+  push:
+    branches: [ main ]
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        type: choice
+        options: [ plan, apply, destroy ]
+        default: 'plan'
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+jobs:
+  terraform-plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      plan_exit_code: ${{ steps.plan.outputs.exit_code }}
+    defaults:
+      run:
+        working-directory: terraform/main
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          exit_code=0
+          [ -z "${{ secrets.AZURE_CLIENT_ID }}" ] && echo "::error::Missing AZURE_CLIENT_ID" && exit_code=1
+          [ -z "${{ secrets.AZURE_CLIENT_SECRET }}" ] && echo "::error::Missing AZURE_CLIENT_SECRET" && exit_code=1
+          [ -z "${{ secrets.AZURE_TENANT_ID }}" ] && echo "::error::Missing AZURE_TENANT_ID" && exit_code=1
+          [ -z "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ] && echo "::error::Missing AZURE_SUBSCRIPTION_ID" && exit_code=1
+          exit $exit_code
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+          terraform_wrapper: false
+
+      - name: Clean Terraform cache
+        run: |
+          rm -rf .terraform
+          rm -f .terraform.lock.hcl
+          rm -f terraform.tfstate*
+
+      - name: Terraform Init
+        run: terraform init -backend-config=../backend.hcl -reconfigure -input=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -no-color -out=tfplan.bin -detailed-exitcode 2>&1 | tee plan.txt
+          PLAN_EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$PLAN_EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          if [ $PLAN_EXIT_CODE -eq 0 ]; then
+            echo "::notice::No changes. Infrastructure is up-to-date."
+          elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+            echo "::notice::Changes detected."
+          else
+            echo "::error::Terraform plan failed."
+            exit 1
+          fi
+
+      - name: Upload plan artifact
+        if: steps.plan.outputs.exit_code == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/main/tfplan.bin
+          retention-days: 5
+
+      - name: Comment PR with plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/main/plan.txt', 'utf8');
+            const output = `#### Terraform Plan 📋
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+            
+            </details>
+            
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  terraform-apply:
+    needs: terraform-plan
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.terraform-plan.outputs.plan_exit_code == '2') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    environment:
+      name: production
+    defaults:
+      run:
+        working-directory: terraform/main
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config=../backend.hcl -reconfigure -input=false
+
+      - name: Auto-import existing resources if not in state
+        continue-on-error: true
+        run: |
+          echo "Checking if resources need to be imported..."
+          
+          # Check if Container Apps Environment exists in Azure but not in state
+          if az containerapp env show --name yousef-aca-env-prod-v2 --resource-group Yousef-rg &>/dev/null; then
+            echo "Container Apps Environment exists in Azure..."
+            if ! terraform state show 'module.container_apps_env.azurerm_container_app_environment.main' &>/dev/null; then
+              echo "Not in Terraform state - importing..."
+              terraform import 'module.container_apps_env.azurerm_container_app_environment.main' \
+                "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/Yousef-rg/providers/Microsoft.App/managedEnvironments/yousef-aca-env-prod-v2" || true
+            else
+              echo "Already in Terraform state - skipping"
+            fi
+          fi
+          
+          # Check if frontend Container App needs importing
+          if az containerapp show --name ca-frontend --resource-group Yousef-rg &>/dev/null; then
+            if ! terraform state show 'module.frontend_container_app.azurerm_container_app.main' &>/dev/null; then
+              echo "Importing frontend container app..."
+              terraform import 'module.frontend_container_app.azurerm_container_app.main' \
+                "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/Yousef-rg/providers/Microsoft.App/containerApps/ca-frontend" || true
+            fi
+          fi
+          
+          # Check if backend Container App needs importing
+          if az containerapp show --name ca-backend --resource-group Yousef-rg &>/dev/null; then
+            if ! terraform state show 'module.backend_container_app.azurerm_container_app.main' &>/dev/null; then
+              echo "Importing backend container app..."
+              terraform import 'module.backend_container_app.azurerm_container_app.main' \
+                "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/Yousef-rg/providers/Microsoft.App/containerApps/ca-backend" || true
+            fi
+          fi
+          
+          echo "Import check complete!"
+
+      - name: Download plan artifact
+        if: github.event_name == 'push'
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/main
+
+      - name: Terraform Apply
+        run: |
+          if [ -f tfplan.bin ]; then
+            terraform apply -auto-approve tfplan.bin
+          else
+            terraform apply -auto-approve
+          fi
+
+      - name: Terraform Output
+        run: terraform output -json > outputs.json
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs
+          path: terraform/main/outputs.json
+          retention-days: 30
+
+  terraform-destroy:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    environment:
+      name: production
+    defaults:
+      run:
+        working-directory: terraform/main
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.8'
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -backend-config=../backend.hcl -reconfigure -input=false
+
+      - name: Pre-destroy - Delete Container Apps first
+        continue-on-error: true
+        run: |
+          echo "=== Deleting Container Apps and Environment BEFORE Terraform destroy ==="
+          echo "This prevents subnet deletion errors caused by leftover AKS resources"
+          
+          # Delete Container Apps first
+          echo "Deleting frontend container app..."
+          az containerapp delete --name ca-frontend --resource-group Yousef-rg --yes || true
+          
+          echo "Deleting backend container app..."
+          az containerapp delete --name ca-backend --resource-group Yousef-rg --yes || true
+          
+          # Wait for apps to delete
+          echo "Waiting 30 seconds for container apps to delete..."
+          sleep 30
+          
+          # Delete ALL Container Apps Environments (this will clean up AKS resources)
+          echo "Deleting ALL Container Apps Environments..."
+          for env_name in $(az containerapp env list --resource-group Yousef-rg --query "[].name" -o tsv); do
+            echo "Deleting environment: $env_name"
+            az containerapp env delete --name "$env_name" --resource-group Yousef-rg --yes || true
+          done
+          
+          # Wait for environments to delete (this is critical!)
+          echo "Waiting 120 seconds for environments and AKS resources to fully delete..."
+          sleep 120
+          
+          echo "=== Pre-destroy cleanup complete ==="
+
+      - name: Clean up any corrupted state
+        continue-on-error: true
+        run: |
+          # Remove resources from state since we deleted them manually
+          terraform state rm 'module.container_apps_env.azurerm_container_app_environment.main' || true
+          terraform state rm 'module.container_app_frontend.azurerm_container_app.main' || true
+          terraform state rm 'module.container_app_backend.azurerm_container_app.main' || true
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+
+      - name: Manual cleanup of stuck resources
+        continue-on-error: true
+        run: |
+          echo "Cleaning up any remaining Container Apps resources..."
+          az containerapp delete --name ca-frontend --resource-group Yousef-rg --yes --no-wait || true
+          az containerapp delete --name ca-backend --resource-group Yousef-rg --yes --no-wait || true
+          az containerapp env delete --name yousef-aca-env-prod-v2 --resource-group Yousef-rg --yes --no-wait || true
+          echo "Cleanup commands issued. Resources will be deleted in the background."

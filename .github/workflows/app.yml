@@ -1,0 +1,250 @@
+name: Application - Backend & Frontend
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+  workflow_dispatch:
+
+env:
+  BACKEND_DOCKER_REPO: docker.io/youkim7/backend
+  FRONTEND_DOCKER_REPO: docker.io/youkim7/frontend
+
+jobs:
+  # Backend Jobs
+  backend-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Run tests
+        working-directory: ./backend
+        run: mvn clean test
+
+  backend-build-push:
+    needs: backend-test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.primary }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Build application
+        working-directory: ./backend
+        run: mvn clean package -DskipTests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate image tags
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "tags=${{ env.BACKEND_DOCKER_REPO }}:latest,${{ env.BACKEND_DOCKER_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "primary=${{ env.BACKEND_DOCKER_REPO }}:latest" >> $GITHUB_OUTPUT
+          else
+            echo "tags=${{ env.BACKEND_DOCKER_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "primary=${{ env.BACKEND_DOCKER_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Frontend Jobs
+  frontend-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ./frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Run tests
+        working-directory: ./frontend
+        run: npm run test -- --run
+
+      - name: Run lint
+        working-directory: ./frontend
+        run: npm run lint
+
+  frontend-build-push:
+    needs: frontend-test
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.primary }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ./frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Build application
+        working-directory: ./frontend
+        env:
+          VITE_API_BASE_URL: ${{ secrets.FE_API_BASE_URL }}
+        run: npm run build
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate image tags
+        id: meta
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "tags=${{ env.FRONTEND_DOCKER_REPO }}:latest,${{ env.FRONTEND_DOCKER_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "primary=${{ env.FRONTEND_DOCKER_REPO }}:latest" >> $GITHUB_OUTPUT
+          else
+            echo "tags=${{ env.FRONTEND_DOCKER_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "primary=${{ env.FRONTEND_DOCKER_REPO }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            VITE_API_BASE_URL=http://172.171.116.40
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Deploy to Azure Container Apps
+  deploy:
+    needs: [ backend-build-push, frontend-build-push ]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure CLI login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Update Backend Container App
+        run: |
+          if az containerapp show --name ca-backend --resource-group Yousef-rg &> /dev/null; then
+            echo "Updating backend container app..."
+            az containerapp update \
+              --name ca-backend \
+              --resource-group Yousef-rg \
+              --image "${{ needs.backend-build-push.outputs.image_tag }}"
+          else
+            echo "Backend container app does not exist. Skipping update."
+            echo "Please deploy infrastructure using Terraform first."
+          fi
+
+      - name: Update Frontend Container App
+        run: |
+          if az containerapp show --name ca-frontend --resource-group Yousef-rg &> /dev/null; then
+            echo "Updating frontend container app..."
+            az containerapp update \
+              --name ca-frontend \
+              --resource-group Yousef-rg \
+              --image "${{ needs.frontend-build-push.outputs.image_tag }}"
+          else
+            echo "Frontend container app does not exist. Skipping update."
+            echo "Please deploy infrastructure using Terraform first."
+          fi
+
+      - name: Verify deployments
+        run: |
+          if az containerapp show --name ca-backend --resource-group Yousef-rg &> /dev/null; then
+            echo "Backend deployment status:"
+            az containerapp show \
+              --name ca-backend \
+              --resource-group Yousef-rg \
+              --query "properties.latestRevisionName" -o tsv
+          else
+            echo "Backend container app not found"
+          fi
+          
+          if az containerapp show --name ca-frontend --resource-group Yousef-rg &> /dev/null; then
+            echo "Frontend deployment status:"
+            az containerapp show \
+              --name ca-frontend \
+              --resource-group Yousef-rg \
+              --query "properties.latestRevisionName" -o tsv
+          else
+            echo "Frontend container app not found"
+          fi
