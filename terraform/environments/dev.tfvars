@@ -23,8 +23,8 @@ aca_ca_subnet_cidr = "10.0.6.0/23"
 
 
 # Docker Hub
-dockerhub_org  = "youkim7"
-dockerhub_user = "youkim7"
+dockerhub_org  = "CHANGE_TO_YOUR_DOCKERHUB_USERNAME"
+dockerhub_user = "CHANGE_TO_YOUR_DOCKERHUB_USERNAME"
 
 # Image tags
 fe_image_tag  = "dev-001"

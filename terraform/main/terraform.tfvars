@@ -22,8 +22,8 @@ sql_database_name = "sqldb-abdullah-burgerbuilder"
 sql_admin_login   = "abdullah-admin"
 
 # Docker Hub
-dockerhub_org  = "youkim7"
-dockerhub_user = "youkim7"
+dockerhub_org  = "CHANGE_TO_YOUR_DOCKERHUB_USERNAME"
+dockerhub_user = "CHANGE_TO_YOUR_DOCKERHUB_USERNAME"
 
 # Image Tags
 fe_image_tag  = "dev-010"
